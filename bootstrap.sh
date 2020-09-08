@@ -1,4 +1,4 @@
-
+#!/bin/bash
 
 sudo su root
 
@@ -19,6 +19,8 @@ if [[ $(which docker) && $(docker --version) ]]; then
     ./build-images.sh
 
     wget https://bc-ephemeral.s3.amazonaws.com/_easysync_db.zip && ./import-db.sh ./_easysync_db.zip
+    # TODO: 1. inject the miner key in ./config
+    #       2. start the miner
 
 else
     echo "Install docker and nvidia-docker"
