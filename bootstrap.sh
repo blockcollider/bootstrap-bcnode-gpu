@@ -1,58 +1,101 @@
 #!/bin/bash
 
-sudo su root
+set -e
 
-msg=$(cat /etc/os-release | grep PRETTY_NAME | grep 'Linux 10')
+BOOTSTRAP_DIR="/mnt/gpu-miner-bootstrap/"
+mkdir -p $BOOTSTRAP_DIR
 
-if [ -z $msg ]; then
-    echo "OS has to be Debian GNU/Linux 10 (buster)"
-    exit 1
-fi
+# has to run under root
+
+function install_docker {
+    if [[ $(which docker) && $(docker --version) ]]; then
+        echo "docker is already installed"
+    else
+        apt-get update -y > /dev/null
+        apt-get install -y ca-certificates apt-transport-https gnupg2 software-properties-common
+        apt-get install -y unzip gcc make git net-tools vim tmux lshw jq wget curl  build-essential
+
+        # install docker
+        curl -fsSL https://download.docker.com/linux/debian/gpg | apt-key add -
+        add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/debian buster stable"
+        apt-get update -y  > /dev/null
+        apt-get install -y docker-ce docker-ce-cli containerd.io
+    fi
+}
+
+function install_nvdia_cuda {
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get -y install linux-headers-$(uname -r)
+
+    cd $BOOTSTRAP_DIR;
+    if [ ! -f "$BOOTSTRAP_DIR/NVIDIA-Linux-x86_64-440.33.01.run" ]; then
+        wget http://us.download.nvidia.com/tesla/440.33.01/NVIDIA-Linux-x86_64-440.33.01.run
+    fi
+    chmod +x NVIDIA-Linux-x86_64-440.33.01.run
+
+    if [[ $(which nvidia-smi) && $(nvidia-smi -L) ]]; then
+        echo "nvidia cuda driver is already installed"
+        nvidia-smi -L
+    else
+        ./NVIDIA-Linux-x86_64-440.33.01.run -s
+    fi
+}
+
+function install_nvdia_docker_toolkit {
+    if [[ $(which nvidia-container-toolkit) ]]; then
+        echo "nvidia-container-toolkit is already installed"
+    else
+        distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
+        curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | apt-key add -
+        curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list | tee /etc/apt/sources.list.d/nvidia-docker.list
+
+        apt-get update && apt-get install -y nvidia-container-toolkit
+    fi
+}
+
+function ensure_os_version {
+    distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
+
+    if [ $distribution != "debian10" ]; then
+        echo "OS has to be Debian GNU/Linux 10 (buster)"
+        exit 1
+    fi
+}
 
 
-if [[ $(which docker) && $(docker --version) ]]; then
+function test_run_nvidia_cuda {
     docker run --gpus all nvidia/cuda:10.0-base nvidia-smi
+}
 
-    # build gpu bcnode image
-    cd /tmp
-    git clone https://github.com/trick77/bcnode-gpu-docker bcnode-gpu-docker && cd $_
-    ./build-images.sh
 
-    wget https://bc-ephemeral.s3.amazonaws.com/_easysync_db.zip && ./import-db.sh ./_easysync_db.zip
+function provision_gpu_docker {
+    install_docker
+
+    systemctl start docker
+
+    install_nvdia_cuda
+
+    install_nvdia_docker_toolkit
+
+    reboot
+}
+
+ensure_os_version
+
+if [[ $(which docker) && $(docker --version) && $(test_run_nvidia_cuda) ]]; then
+    cd $BOOTSTRAP_DIR
+    if [ ! -d "$BOOTSTRAP_DIR/bcnode-gpu-docker" ]; then
+        git clone --depth 1 https://github.com/trick77/bcnode-gpu-docker bcnode-gpu-docker
+    fi
+    cd bcnode-gpu-docker
+    time ./build-images.sh # 18 minutes
+
+    time wget https://bc-ephemeral.s3.amazonaws.com/_easysync_db.zip -O /tmp/_easysync_db.zip # 10 minutes
+    echo "yy" | ./import-db.sh /tmp/_easysync_db.zip
+
     # TODO: 1. inject the miner key in ./config
     #       2. start the miner
 
 else
-    echo "Install docker and nvidia-docker"
-
-    apt update -y
-    apt install -y git net-tools vim tmux lshw jq wget curl ca-certificates apt-transport-https gnupg2 software-properties-common unzip
-
-    # install docker
-    curl -fsSL https://download.docker.com/linux/debian/gpg | apt-key add -
-    add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/debian buster stable"
-    apt update -y
-    apt-get install -y docker-ce docker-ce-cli containerd.io
-    systemctl start docker
-    # end install docker
-
-    # install nvidia driver
-    apt install -y linux-headers-4.19.0-10-cloud-amd64
-
-    export DEBIAN_FRONTEND=noninteractive
-    cd /tmp; wget http://us.download.nvidia.com/tesla/440.33.01/NVIDIA-Linux-x86_64-440.33.01.run
-    chmod +x NVIDIA-Linux-x86_64-440.33.01.run
-
-    ./NVIDIA-Linux-x86_64-440.33.01.run -s
-
-    ## nvidia-docker
-    distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
-    curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | apt-key add -
-    curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list | tee /etc/apt/sources.list.d/nvidia-docker.list
-
-    apt-get update && apt-get install -y nvidia-container-toolkit
-    systemctl restart docker
-
-    # end install nvidia driver
-    reboot # to pick up changes
+    provision_gpu_docker
 fi
