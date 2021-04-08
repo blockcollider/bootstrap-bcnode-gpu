@@ -1,0 +1,212 @@
+#!/bin/bash
+
+set -e
+
+action=$1
+BC_MINER_KEY=$2
+
+BOOTSTRAP_DIR="/mnt/gpu-miner-bootstrap/"
+mkdir -p $BOOTSTRAP_DIR
+
+BC_MINER_KEY_LOCATION="$BOOTSTRAP_DIR/bc_miner_key"
+
+function echo_help {
+    echo "Usage:"
+    echo "  overline_gpu_miner <command> <MINER_KEY>"
+    echo ""
+    echo "Commands:"
+    echo "  bootstrap            Bootstrap a new host"
+    echo "  miner_key            Print miner key"
+    echo "  reload               Reload snapshot and start to mine"
+    echo "  start                Start the miner"
+    echo "  stop                 Stop the miner"
+}
+
+if [ -z "$BC_MINER_KEY" ]; then
+   if [ -f $BC_MINER_KEY_LOCATION ]; then
+        BC_MINER_KEY=$(cat $BC_MINER_KEY_LOCATION)
+   fi
+
+   if [ "$action" != "stop" ]; then
+     echo "BC_MINER_KEY is required"
+     echo_help
+     exit 1
+   fi
+else
+   echo $BC_MINER_KEY > $BC_MINER_KEY_LOCATION
+fi
+
+# has to run under root
+
+function ensure_disk_size {
+    min_disk_size=62914560 # 60GB
+    disk_size=$(df | grep /$ | awk '{ print $2 }')
+    if [ "$disk_size" -lt "$min_disk_size" ]; then
+        echo "Insufficient Disk Size. Requires at least 60GB"
+        exit 1
+    fi
+}
+
+
+function install_docker {
+    if [[ $(which docker) && $(docker --version) ]]; then
+        echo "docker is already installed"
+    else
+        apt-get update -y > /dev/null
+        apt-get install -y ca-certificates apt-transport-https gnupg2 software-properties-common
+        apt-get install -y unzip gcc make git net-tools vim tmux lshw jq wget curl  build-essential
+
+        # install docker
+        curl -fsSL https://download.docker.com/linux/debian/gpg | apt-key add -
+        add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/debian buster stable"
+        apt-get update -y  > /dev/null
+        apt-get install -y docker-ce docker-ce-cli containerd.io
+    fi
+}
+
+function install_nvdia_cuda {
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get -y install linux-headers-$(uname -r)
+
+    cd $BOOTSTRAP_DIR;
+    if [ ! -f "$BOOTSTRAP_DIR/NVIDIA-Linux-x86_64-440.33.01.run" ]; then
+        wget -q http://us.download.nvidia.com/tesla/440.33.01/NVIDIA-Linux-x86_64-440.33.01.run
+    fi
+    chmod +x NVIDIA-Linux-x86_64-440.33.01.run
+
+    if [[ $(which nvidia-smi) && $(nvidia-smi -L | grep UUID) ]]; then
+        echo "nvidia cuda driver is already installed"
+        nvidia-smi -L
+    else
+        ./NVIDIA-Linux-x86_64-440.33.01.run -s
+    fi
+}
+
+function install_nvdia_docker_toolkit {
+    if [[ $(which nvidia-container-toolkit) ]]; then
+        echo "nvidia-container-toolkit is already installed"
+    else
+        distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
+        curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | apt-key add -
+        curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list | tee /etc/apt/sources.list.d/nvidia-docker.list
+
+        apt-get update && apt-get install -y nvidia-container-toolkit
+    fi
+}
+
+function ensure_os_version {
+    distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
+
+    if [ $distribution != "debian10" ]; then
+        echo "OS has to be Debian GNU/Linux 10 (buster)"
+        exit 1
+    fi
+}
+
+
+function test_run_nvidia_cuda {
+    docker run --rm --gpus all nvidia/cuda:10.0-base nvidia-smi
+}
+
+function clone_gpu_docker_repo {
+    if [ ! -d "$BOOTSTRAP_DIR/bcnode-gpu-docker" ]; then
+        cd $BOOTSTRAP_DIR
+        git clone --depth 1 https://github.com/trick77/bcnode-gpu-docker bcnode-gpu-docker
+    fi
+}
+
+
+function provision_gpu_docker {
+    install_docker
+
+    systemctl start docker
+
+    install_nvdia_cuda
+
+    install_nvdia_docker_toolkit
+
+    clone_gpu_docker_repo
+
+    if [[ $(which docker) && $(docker --version) && $(test_run_nvidia_cuda) ]]; then
+        echo "Nvidia cuda driver and its docker toolkit is ready to use"
+    else
+        echo "Reboot load Nvidia cuda driver"
+        reboot
+    fi
+}
+
+function build_docker_images() {
+    cd $BOOTSTRAP_DIR/bcnode-gpu-docker
+    # this ensure latest docker is pulled
+    docker rmi blockcollider/bcnode:latest || true
+
+    time ./build-images.sh --nopurge # 18 minutes
+}
+
+function load_new_snapshot() {
+    cd $BOOTSTRAP_DIR/bcnode-gpu-docker
+    rm /tmp/_easysync_db.zip || true
+    time wget -q https://bc-ephemeral.s3.amazonaws.com/_easysync_db.zip -O /tmp/_easysync_db.zip # 10 minutes
+    time echo "yy" | ./import-db.sh /tmp/_easysync_db.zip # 20 min
+}
+
+function start_to_mine {
+    cd $BOOTSTRAP_DIR/bcnode-gpu-docker
+    ./cleanup.sh || true
+
+    sed -i "s/BC_MINER_KEY=.*/BC_MINER_KEY=$BC_MINER_KEY/g" config
+
+    ./start.sh
+}
+
+function install_reboot_crontab {
+    if [[ $(crontab -l | grep overline_gpu_miner) ]]; then
+        echo "reboot crontab is already installed"
+    else
+        echo "Installing overline_gpu_miner bootstrap reboot crontab"
+        cd /tmp
+        echo "@reboot /usr/local/bin/overline_gpu_miner bootstrap > /tmp/overline_bootstrap.log 2>&1" > overline_bootstrap
+        crontab overline_bootstrap
+    fi
+}
+
+if [ "$action" == "bootstrap" ]; then
+    echo "Start to bootstrap"
+
+    if [[ $(which docker) && $(docker --version) && $(test_run_nvidia_cuda) ]]; then
+        echo "No need to intall reboot crontab since reboot is already done"
+        crontab -r # remove all crontab
+    else
+        install_reboot_crontab
+    fi
+
+    ensure_os_version
+    ensure_disk_size
+
+    provision_gpu_docker # this will reboot on bootstrap
+
+    build_docker_images
+    load_new_snapshot
+    start_to_mine
+    echo "Bootstrap is done" # don't change this
+elif [ "$action" == "provision_status" ]; then
+    if [[ $(which docker) && $(docker --version) && $(test_run_nvidia_cuda) ]]; then
+        echo "Provision is done"
+    else
+        exit 1
+    fi
+elif [ "$action" == "reload" ]; then
+    build_docker_images
+    load_new_snapshot
+    start_to_mine
+elif [ "$action" == "miner_key" ]; then
+    cat $BC_MINER_KEY_LOCATION
+elif [ "$action" == "start" ]; then
+    start_to_mine
+elif [ "$action" == "stop" ]; then
+    cd $BOOTSTRAP_DIR/bcnode-gpu-docker
+    ./cleanup.sh || true
+else
+    echo_help
+fi
+
